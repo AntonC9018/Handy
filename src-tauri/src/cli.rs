@@ -4,6 +4,15 @@ use std::path::PathBuf;
 #[derive(Parser, Debug, Clone, Default)]
 #[command(name = "handy", about = "Handy - Speech to Text")]
 pub struct CliArgs {
+    /// Run a local transcription server on 127.0.0.1. Requires HANDY_SERVER_TOKEN.
+    /// Initializes only model/transcription managers, without recording or pasting.
+    #[arg(long, value_name = "PORT", conflicts_with_all = ["transcribe_file", "list_devices", "list_models"])]
+    pub serve: Option<u16>,
+
+    /// Download --model from Handy's model catalog before serving.
+    #[arg(long, requires = "serve")]
+    pub download_model: bool,
+
     /// Start with the main window hidden
     #[arg(long)]
     pub start_hidden: bool,

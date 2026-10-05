@@ -1181,6 +1181,15 @@ impl TranscriptionManager {
     }
 
     pub fn transcribe(&self, audio: Vec<f32>) -> Result<String> {
+        self.transcribe_with_options(audio, None)
+    }
+
+    /// Request-local language/translation options; never changes stored settings.
+    pub fn transcribe_with_options(
+        &self,
+        audio: Vec<f32>,
+        options: Option<(&str, bool)>,
+    ) -> Result<String> {
         #[cfg(debug_assertions)]
         if std::env::var("HANDY_FORCE_TRANSCRIPTION_FAILURE").is_ok() {
             return Err(anyhow::anyhow!(
@@ -1217,7 +1226,11 @@ impl TranscriptionManager {
         }
 
         // Get current settings for configuration
-        let settings = get_settings(&self.app_handle);
+        let mut settings = get_settings(&self.app_handle);
+        if let Some((language, translate)) = options {
+            settings.selected_language = language.to_owned();
+            settings.translate_to_english = translate;
+        }
 
         // Validate selected language against the model's supported languages.
         // If the language isn't supported, fall back to "auto" to prevent errors.

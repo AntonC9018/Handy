@@ -29,6 +29,7 @@ serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 
 [dependencies]
+handy-local-server = { path = "../local-server" }
 once_cell = "1"
 tauri = { version = "2.11.5", features = [
   "protocol-asset",

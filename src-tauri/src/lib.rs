@@ -12,6 +12,7 @@ mod commands;
 mod helpers;
 mod input;
 mod llm_client;
+mod local_server;
 mod managers;
 mod memory;
 mod overlay;
@@ -785,8 +786,10 @@ pub fn run(cli_args: CliArgs) {
 
     // The headless path must run as its own instance (see the single-instance
     // note below), not forward to an already-running app.
-    let headless_mode =
-        cli_args.transcribe_file.is_some() || cli_args.list_devices || cli_args.list_models;
+    let headless_mode = cli_args.serve.is_some()
+        || cli_args.transcribe_file.is_some()
+        || cli_args.list_devices
+        || cli_args.list_models;
 
     #[allow(unused_mut)]
     let mut builder = tauri::Builder::default()
@@ -851,6 +854,7 @@ pub fn run(cli_args: CliArgs) {
     // app is already open, so skip it in headless mode and run a standalone
     // instance instead.
     if !headless_mode {
+        builder = builder.plugin(tauri_plugin_clipboard_manager::init());
         builder = builder.plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             if args.iter().any(|a| a == "--toggle-transcription") {
                 signal_handle::send_transcription_input(app, "transcribe", "CLI");
@@ -878,7 +882,6 @@ pub fn run(cli_args: CliArgs) {
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_os::init())
-        .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_macos_permissions::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_store::Builder::default().build())
@@ -923,7 +926,13 @@ pub fn run(cli_args: CliArgs) {
                 let handle = app_handle.clone();
                 let args = cli_args.clone();
                 std::thread::spawn(move || {
-                    let code = run_headless_guarded(|| run_headless_transcription(&handle, &args));
+                    let code = run_headless_guarded(|| {
+                        if args.serve.is_some() {
+                            local_server::run(&handle, &args)
+                        } else {
+                            run_headless_transcription(&handle, &args)
+                        }
+                    });
                     // Drop the loaded engine before teardown: ggml-metal's global
                     // device free asserts (SIGABRT) if a model's Metal resources
                     // are still alive at C++ static-destructor time.
