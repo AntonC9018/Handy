@@ -1360,7 +1360,7 @@ impl TranscriptionManager {
                 );
             }
 
-            let mut engine_segments: Vec<TimedSegment> = Vec::new();
+            let engine_segments;
             let transcribe_result = catch_unwind(AssertUnwindSafe(|| -> Result<(String, Vec<TimedSegment>)> {
                 match &mut engine {
                     LoadedEngine::TranscribeCpp(session) => {
