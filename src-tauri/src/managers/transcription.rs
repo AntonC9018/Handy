@@ -57,7 +57,8 @@ pub struct TimedTranscription {
 }
 
 /// Copy transcribe-cpp's segment rows into seconds-based, text-only rows; empty
-/// rows are dropped.
+/// rows and zero-span rows (engines that report no times) are dropped so the
+/// whole-request fallback in the server backend takes over.
 fn timed_segments(segments: &[transcribe_cpp::Segment]) -> Vec<TimedSegment> {
     segments
         .iter()
@@ -66,7 +67,7 @@ fn timed_segments(segments: &[transcribe_cpp::Segment]) -> Vec<TimedSegment> {
             end: s.t1_ms.max(s.t0_ms) as f64 / 1000.0,
             text: s.text.trim().to_string(),
         })
-        .filter(|s| !s.text.is_empty())
+        .filter(|s| !s.text.is_empty() && s.end > s.start)
         .collect()
 }
 
@@ -1435,7 +1436,7 @@ impl TranscriptionManager {
                                                 end: s.end.max(s.start) as f64,
                                                 text: s.text.trim().to_string(),
                                             })
-                                            .filter(|s| !s.text.is_empty())
+                                            .filter(|s| !s.text.is_empty() && s.end > s.start)
                                             .collect()
                                     })
                                     .unwrap_or_default();
