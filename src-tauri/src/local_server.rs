@@ -5,7 +5,7 @@ use crate::settings::{
     TranscribeAcceleratorSetting,
 };
 use crate::CliArgs;
-use handy_local_server::{Backend, ControlRequest, LocalServer, ModelRequest};
+use handy_local_server::{Backend, ControlRequest, LocalServer, ModelRequest, Segment, Transcription};
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Manager};
@@ -200,7 +200,7 @@ impl Backend for HandyBackend {
         Ok(self.status())
     }
 
-    fn transcribe(&self, pcm: Vec<f32>, language: &str, translate: bool) -> Result<String, String> {
+    fn transcribe(&self, pcm: Vec<f32>, language: &str, translate: bool) -> Result<Transcription, String> {
         let model = self
             .selected_model
             .lock()
@@ -213,9 +213,29 @@ impl Backend for HandyBackend {
                 .load_model_with_device(&model, self.device_index)
                 .map_err(|_| "Handy model load failed.")?;
         }
-        self.transcription
-            .transcribe_with_options(pcm, Some((language, translate)))
-            .map_err(|_| "Handy transcription failed.".into())
+        // The request PCM is 16 kHz mono, like Handy's own recordings.
+        let duration_secs = pcm.len() as f64 / 16_000.0;
+        let mut result = self
+            .transcription
+            .transcribe_timed_with_options(pcm, Some((language, translate)))
+            .map_err(|_| "Handy transcription failed.".to_string())?;
+        // Engines without segment timings still get one row spanning the whole
+        // request, so timing-based clients (FilmCraft) have bounds to place words in.
+        if result.segments.is_empty() && !result.text.is_empty() {
+            result.segments.push(crate::managers::transcription::TimedSegment {
+                start: 0.0,
+                end: duration_secs,
+                text: result.text.clone(),
+            });
+        }
+        Ok(Transcription {
+            text: result.text,
+            segments: result
+                .segments
+                .into_iter()
+                .map(|s| Segment { start: s.start, end: s.end, text: s.text })
+                .collect(),
+        })
     }
 }
 

@@ -28,6 +28,22 @@ pub enum ControlRequest {
     UnloadTimeout { value: String },
 }
 
+/// One timed stretch of a transcription reply. Times are seconds from the audio's
+/// first sample; engines without timings send no segments at all.
+#[derive(Debug, serde::Serialize)]
+pub struct Segment {
+    pub start: f64,
+    pub end: f64,
+    pub text: String,
+}
+
+/// A transcription: the full text and, when the engine produced them, timed segments.
+#[derive(Debug, Default, serde::Serialize)]
+pub struct Transcription {
+    pub text: String,
+    pub segments: Vec<Segment>,
+}
+
 /// Implemented by the app using its existing model and transcription managers.
 pub trait Backend: Send + Sync + 'static {
     fn status(&self) -> Value;
@@ -36,7 +52,7 @@ pub trait Backend: Send + Sync + 'static {
     fn control(&self, _request: ControlRequest) -> Result<Value, String> {
         Err("Controls are unavailable.".into())
     }
-    fn transcribe(&self, pcm: Vec<f32>, language: &str, translate: bool) -> Result<String, String>;
+    fn transcribe(&self, pcm: Vec<f32>, language: &str, translate: bool) -> Result<Transcription, String>;
 }
 
 pub struct LocalServer {
@@ -256,7 +272,8 @@ impl LocalServer {
                 let (status, response) = if is_audio {
                     match decode_pcm(&bytes) {
                         Ok(pcm) => match backend.transcribe(pcm, &language, translate) {
-                            Ok(text) => (200, json!({"text": text})),
+                            // `segments` is additive: text-only clients keep working.
+                            Ok(t) => (200, json!({"text": t.text, "segments": t.segments})),
                             Err(_) => (503, json!({"error": "transcription_unavailable"})),
                         },
                         Err(_) => (400, json!({"error": "invalid_audio"})),

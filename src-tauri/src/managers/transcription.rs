@@ -40,6 +40,36 @@ use transcribe_rs::{
 const STREAM_PERF_LOG_INTERVAL: Duration = Duration::from_secs(5);
 const STREAM_FINALIZE_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// One timed stretch of a transcription. Times are seconds from the audio's first sample.
+#[derive(Clone, Debug, Default)]
+pub struct TimedSegment {
+    pub start: f64,
+    pub end: f64,
+    pub text: String,
+}
+
+/// Transcription text together with the engine's segment timings, for callers that
+/// place words on a timeline (the local server's external clients, e.g. FilmCraft).
+#[derive(Clone, Debug, Default)]
+pub struct TimedTranscription {
+    pub text: String,
+    pub segments: Vec<TimedSegment>,
+}
+
+/// Copy transcribe-cpp's segment rows into seconds-based, text-only rows; empty
+/// rows are dropped.
+fn timed_segments(segments: &[transcribe_cpp::Segment]) -> Vec<TimedSegment> {
+    segments
+        .iter()
+        .map(|s| TimedSegment {
+            start: s.t0_ms.max(0) as f64 / 1000.0,
+            end: s.t1_ms.max(s.t0_ms) as f64 / 1000.0,
+            text: s.text.trim().to_string(),
+        })
+        .filter(|s| !s.text.is_empty())
+        .collect()
+}
+
 fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(message) = payload.downcast_ref::<&str>() {
         (*message).to_string()
@@ -1190,6 +1220,17 @@ impl TranscriptionManager {
         audio: Vec<f32>,
         options: Option<(&str, bool)>,
     ) -> Result<String> {
+        self.transcribe_timed_with_options(audio, options)
+            .map(|t| t.text)
+    }
+
+    /// [`Self::transcribe_with_options`] keeping the engine's segment timings
+    /// (empty when the engine produces none).
+    pub fn transcribe_timed_with_options(
+        &self,
+        audio: Vec<f32>,
+        options: Option<(&str, bool)>,
+    ) -> Result<TimedTranscription> {
         #[cfg(debug_assertions)]
         if std::env::var("HANDY_FORCE_TRANSCRIPTION_FAILURE").is_ok() {
             return Err(anyhow::anyhow!(
@@ -1208,7 +1249,7 @@ impl TranscriptionManager {
         if audio.is_empty() {
             debug!("Empty audio vector");
             self.maybe_unload_immediately("empty audio");
-            return Ok(String::new());
+            return Ok(TimedTranscription::default());
         }
 
         // Check if model is loaded, if not try to load it
@@ -1270,7 +1311,7 @@ impl TranscriptionManager {
         // Perform transcription with the appropriate engine.
         // We use catch_unwind to prevent engine panics from poisoning the mutex,
         // which would make the app hang indefinitely on subsequent operations.
-        let (result, output_language, model_languages) = {
+        let (result, result_segments, output_language, model_languages) = {
             let mut engine_guard = self.lock_engine();
 
             // Take the engine out so we own it during transcription.
@@ -1319,7 +1360,8 @@ impl TranscriptionManager {
                 );
             }
 
-            let transcribe_result = catch_unwind(AssertUnwindSafe(|| -> Result<String> {
+            let mut engine_segments: Vec<TimedSegment> = Vec::new();
+            let transcribe_result = catch_unwind(AssertUnwindSafe(|| -> Result<(String, Vec<TimedSegment>)> {
                 match &mut engine {
                     LoadedEngine::TranscribeCpp(session) => {
                         // Custom words become the initial prompt ONLY for models
@@ -1366,7 +1408,8 @@ impl TranscriptionManager {
                                 // Whisper's audio-based LID (auto mode only;
                                 // `None` when a language hint was passed).
                                 model_detected_language = t.language;
-                                t.text
+                                let segments = timed_segments(&t.segments);
+                                (t.text, segments)
                             })
                             .map_err(|e| {
                                 anyhow::anyhow!("transcribe-cpp transcription failed: {}", e)
@@ -1379,16 +1422,34 @@ impl TranscriptionManager {
                         };
                         parakeet_engine
                             .transcribe_with(&audio, &params)
-                            .map(|r| r.text)
+                            .map(|r| {
+                                // transcribe_rs rows are seconds-based, unlike
+                                // transcribe-cpp's millisecond rows.
+                                let segments = r
+                                    .segments
+                                    .as_deref()
+                                    .map(|rows| {
+                                        rows.iter()
+                                            .map(|s| TimedSegment {
+                                                start: s.start.max(0.0) as f64,
+                                                end: s.end.max(s.start) as f64,
+                                                text: s.text.trim().to_string(),
+                                            })
+                                            .filter(|s| !s.text.is_empty())
+                                            .collect()
+                                    })
+                                    .unwrap_or_default();
+                                (r.text, segments)
+                            })
                             .map_err(|e| anyhow::anyhow!("Parakeet transcription failed: {}", e))
                     }
                     LoadedEngine::Moonshine(moonshine_engine) => moonshine_engine
                         .transcribe(&audio, &TranscribeOptions::default())
-                        .map(|r| r.text)
+                        .map(|r| (r.text, Vec::new()))
                         .map_err(|e| anyhow::anyhow!("Moonshine transcription failed: {}", e)),
                     LoadedEngine::MoonshineStreaming(streaming_engine) => streaming_engine
                         .transcribe(&audio, &TranscribeOptions::default())
-                        .map(|r| r.text)
+                        .map(|r| (r.text, Vec::new()))
                         .map_err(|e| {
                             anyhow::anyhow!("Moonshine streaming transcription failed: {}", e)
                         }),
@@ -1408,12 +1469,12 @@ impl TranscriptionManager {
                         };
                         sense_voice_engine
                             .transcribe_with(&audio, &params)
-                            .map(|r| r.text)
+                            .map(|r| (r.text, Vec::new()))
                             .map_err(|e| anyhow::anyhow!("SenseVoice transcription failed: {}", e))
                     }
                     LoadedEngine::GigaAM(gigaam_engine) => gigaam_engine
                         .transcribe(&audio, &TranscribeOptions::default())
-                        .map(|r| r.text)
+                        .map(|r| (r.text, Vec::new()))
                         .map_err(|e| anyhow::anyhow!("GigaAM transcription failed: {}", e)),
                     LoadedEngine::Canary(canary_engine) => {
                         output_was_translated = settings.translate_to_english;
@@ -1430,7 +1491,7 @@ impl TranscriptionManager {
                         };
                         canary_engine
                             .transcribe(&audio, &options)
-                            .map(|r| r.text)
+                            .map(|r| (r.text, Vec::new()))
                             .map_err(|e| anyhow::anyhow!("Canary transcription failed: {}", e))
                     }
                     LoadedEngine::Cohere(cohere_engine) => {
@@ -1446,13 +1507,13 @@ impl TranscriptionManager {
                         };
                         cohere_engine
                             .transcribe(&audio, &options)
-                            .map(|r| r.text)
+                            .map(|r| (r.text, Vec::new()))
                             .map_err(|e| anyhow::anyhow!("Cohere transcription failed: {}", e))
                     }
                 }
             }));
 
-            let text = match transcribe_result {
+            let (text, run_segments) = match transcribe_result {
                 Ok(inner_result) => {
                     // Success or normal error: return the engine unless a model
                     // switch/unload invalidated it while it was in use.
@@ -1505,7 +1566,8 @@ impl TranscriptionManager {
             );
             debug!("Output language evidence: {:?}", output_language);
 
-            (text, output_language, model_languages)
+            engine_segments = run_segments;
+            (text, engine_segments, output_language, model_languages)
         };
 
         // Apply fuzzy word correction if custom words are configured — UNLESS the
@@ -1520,6 +1582,21 @@ impl TranscriptionManager {
             &output_language,
             &model_languages,
         );
+        // The same word correction applies to each segment's text, so segment
+        // rows and the full text never disagree.
+        let filtered_segments = result_segments
+            .into_iter()
+            .map(|mut s| {
+                s.text = post_process_transcription_text(
+                    s.text,
+                    &settings,
+                    model_is_whisper,
+                    &output_language,
+                    &model_languages,
+                );
+                s
+            })
+            .collect::<Vec<_>>();
 
         let et = std::time::Instant::now();
         let translation_note = if settings.translate_to_english {
@@ -1551,7 +1628,7 @@ impl TranscriptionManager {
 
         self.maybe_unload_immediately("transcription");
 
-        Ok(final_result)
+        Ok(TimedTranscription { text: final_result, segments: filtered_segments })
     }
 }
 

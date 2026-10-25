@@ -1,4 +1,6 @@
-use handy_local_server::{Backend, ControlRequest, LocalServer, ModelRequest, MAX_AUDIO_BYTES};
+use handy_local_server::{
+    Backend, ControlRequest, LocalServer, ModelRequest, Segment, Transcription, MAX_AUDIO_BYTES,
+};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -29,7 +31,7 @@ impl Backend for TestBackend {
             _ => Ok(json!({"controlled": true})),
         }
     }
-    fn transcribe(&self, pcm: Vec<f32>, language: &str, translate: bool) -> Result<String, String> {
+    fn transcribe(&self, pcm: Vec<f32>, language: &str, translate: bool) -> Result<Transcription, String> {
         assert_eq!(pcm, vec![0.25, -0.5]);
         if let Some(entered) = &self.entered {
             entered.send(()).unwrap();
@@ -41,7 +43,10 @@ impl Backend for TestBackend {
                 .recv_timeout(Duration::from_secs(5))
                 .unwrap();
         }
-        Ok(format!("{language}:{translate}"))
+        Ok(Transcription {
+            text: format!("{language}:{translate}"),
+            segments: vec![Segment { start: 0.0, end: 0.000125, text: "timed".into() }],
+        })
     }
 }
 
@@ -177,6 +182,9 @@ fn transcribes_valid_audio_with_request_options_and_rejects_malformed_audio() {
     let (code, body) = request(port, "POST", "/transcribe", &audio_headers(), &audio());
     assert_eq!(code, 200);
     assert_eq!(body["text"], "ru:true");
+    // segment timings ride along without changing the text-only contract
+    assert_eq!(body["segments"][0]["text"], "timed");
+    assert_eq!(body["segments"][0]["end"], 0.000125);
     for invalid in [
         vec![1, 2, 3],
         f32::NAN.to_le_bytes().to_vec(),
