@@ -1576,28 +1576,16 @@ impl TranscriptionManager {
         // family). We don't pass a prompt to non-whisper models (it requires the
         // whisper-kind run extension), so they still get fuzzy correction here,
         // same as the ONNX engines.
-        let filtered_result = post_process_transcription_text(
-            result,
+        let processed = post_process_timed_transcription(
+            TimedTranscription {
+                text: result,
+                segments: result_segments,
+            },
             &settings,
             model_is_whisper,
             &output_language,
             &model_languages,
         );
-        // The same word correction applies to each segment's text, so segment
-        // rows and the full text never disagree.
-        let filtered_segments = result_segments
-            .into_iter()
-            .map(|mut s| {
-                s.text = post_process_transcription_text(
-                    s.text,
-                    &settings,
-                    model_is_whisper,
-                    &output_language,
-                    &model_languages,
-                );
-                s
-            })
-            .collect::<Vec<_>>();
 
         let et = std::time::Instant::now();
         let translation_note = if settings.translate_to_english {
@@ -1616,20 +1604,20 @@ impl TranscriptionManager {
             elapsed_secs, audio_secs, speedup, translation_note
         );
 
-        let final_result = filtered_result;
+        let final_result = &processed.text;
 
         if final_result.is_empty() {
             info!("Transcription result is empty");
         } else {
             info!(
                 "Transcription result: {}",
-                crate::utils::redact_text(&final_result)
+                crate::utils::redact_text(final_result)
             );
         }
 
         self.maybe_unload_immediately("transcription");
 
-        Ok(TimedTranscription { text: final_result, segments: filtered_segments })
+        Ok(processed)
     }
 }
 
@@ -1919,6 +1907,46 @@ fn post_process_transcription_text(
 
         normalize_transcription_output(&without_fillers)
     })
+}
+
+/// Keep timed clients on the same text as dictation. Cleanup can cross an engine
+/// segment boundary (multi-word fillers, custom phrases, repeated words), so
+/// independent segment cleanup is not always equivalent to full-text cleanup.
+fn post_process_timed_transcription(
+    mut transcription: TimedTranscription,
+    settings: &AppSettings,
+    custom_words_already_prompted: bool,
+    output_language: &OutputLanguageEvidence,
+    supported_languages: &[String],
+) -> TimedTranscription {
+    let process = |text| {
+        post_process_transcription_text(
+            text,
+            settings,
+            custom_words_already_prompted,
+            output_language,
+            supported_languages,
+        )
+    };
+    transcription.text = process(transcription.text);
+    for segment in &mut transcription.segments {
+        segment.text = process(std::mem::take(&mut segment.text));
+    }
+    transcription
+        .segments
+        .retain(|segment| !segment.text.is_empty());
+    let timed_text = transcription
+        .segments
+        .iter()
+        .flat_map(|segment| segment.text.chars())
+        .filter(|c| !c.is_whitespace());
+    let full_text = transcription.text.chars().filter(|c| !c.is_whitespace());
+    if !timed_text.eq(full_text) {
+        // The server supplies whole-request bounds for engines without reliable
+        // rows. Prefer that fallback to returning words removed from full text.
+        transcription.segments.clear();
+    }
+    transcription
 }
 
 /// Characters to wait for before detecting the preview's language. A lone
@@ -2329,6 +2357,87 @@ mod tests {
 
     fn languages(codes: &[&str]) -> Vec<String> {
         codes.iter().map(|code| (*code).to_string()).collect()
+    }
+
+    #[test]
+    fn timed_cleanup_falls_back_when_a_filler_crosses_segment_boundaries() {
+        let settings = AppSettings {
+            filler_word_removal_enabled: true,
+            custom_filler_words: Some(vec!["you know".into()]),
+            ..Default::default()
+        };
+        let result = post_process_timed_transcription(
+            TimedTranscription {
+                text: "you know this works".into(),
+                segments: vec![
+                    TimedSegment {
+                        start: 0.0,
+                        end: 0.5,
+                        text: "you".into(),
+                    },
+                    TimedSegment {
+                        start: 0.5,
+                        end: 2.0,
+                        text: "know this works".into(),
+                    },
+                ],
+            },
+            &settings,
+            false,
+            &OutputLanguageEvidence::UserSelected("en".into()),
+            &languages(&["en"]),
+        );
+        assert_eq!(result.text, "this works");
+        assert!(
+            result.segments.is_empty(),
+            "inconsistent rows must use whole-request timing"
+        );
+    }
+
+    #[test]
+    fn timed_cleanup_keeps_millisecond_bounds_and_removes_empty_rows() {
+        let segments = timed_segments(&[
+            transcribe_cpp::Segment {
+                t0_ms: 250,
+                t1_ms: 750,
+                text: " hello ".into(),
+                ..Default::default()
+            },
+            transcribe_cpp::Segment {
+                t0_ms: 750,
+                t1_ms: 1000,
+                text: "um".into(),
+                ..Default::default()
+            },
+            transcribe_cpp::Segment {
+                t0_ms: 0,
+                t1_ms: 0,
+                text: "no timing".into(),
+                ..Default::default()
+            },
+        ]);
+        let settings = AppSettings {
+            filler_word_removal_enabled: true,
+            custom_filler_words: Some(vec!["um".into()]),
+            ..Default::default()
+        };
+        let result = post_process_timed_transcription(
+            TimedTranscription {
+                text: "hello um".into(),
+                segments,
+            },
+            &settings,
+            false,
+            &OutputLanguageEvidence::UserSelected("en".into()),
+            &languages(&["en"]),
+        );
+        assert_eq!(result.text, "hello");
+        assert_eq!(result.segments.len(), 1);
+        assert_eq!(
+            (result.segments[0].start, result.segments[0].end),
+            (0.25, 0.75)
+        );
+        assert_eq!(result.segments[0].text, "hello");
     }
 
     #[test]
