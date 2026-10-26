@@ -11,6 +11,8 @@ mod clipboard;
 mod commands;
 mod helpers;
 mod input;
+#[cfg(target_os = "linux")]
+mod linux_webview;
 mod llm_client;
 mod local_server;
 mod managers;
@@ -949,6 +951,9 @@ pub fn run(cli_args: CliArgs) {
                 });
                 return Ok(());
             }
+
+            #[cfg(target_os = "linux")]
+            linux_webview::ensure_font_resolution();
 
             // Create main window programmatically so we can set data_directory
             // for portable mode (redirects WebView2 cache to portable Data dir)
